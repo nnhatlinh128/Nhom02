@@ -10,23 +10,39 @@ using ToursAndTravelsManagement.Services.PdfService;
 using Microsoft.EntityFrameworkCore;
 
 
-
-
 namespace ToursAndTravelsManagement.Controllers;
-
-
 
 
 [Authorize(Policy = "RequireUserRole")] // Chỉ User role mới được vào
 public class UserBookingsController : Controller
 {
-   private readonly IUnitOfWork _unitOfWork;
-   private readonly UserManager<ApplicationUser> _userManager;
-   private readonly IEmailService _emailService;
-   private readonly IPdfService _pdfService;
+    private readonly IUnitOfWork _unitOfWork;
+    private readonly UserManager<ApplicationUser> _userManager;
+    private readonly IEmailService _emailService;
+    private readonly IPdfService _pdfService;
 
 
+    public UserBookingsController(
+        IUnitOfWork unitOfWork,
+        UserManager<ApplicationUser> userManager,
+        IEmailService emailService,
+        IPdfService pdfService)
+    {
+        _unitOfWork = unitOfWork;
+        _userManager = userManager;
+        _emailService = emailService;
+        _pdfService = pdfService;
+    }
 
+    // =========================
+    // GET: UserBookings/AvailableTours
+    // =========================
+    [HttpGet]
+    public async Task<IActionResult> AvailableTours()
+    {
+        var tours = await _unitOfWork.TourRepository.GetAllAsync();
+        return View(tours);
+    }
 
     // =========================
     // GET: UserBookings/BookTour/{id}
@@ -90,11 +106,13 @@ var currentUser = await _userManager.Users
         booking.CreatedBy = currentUser.Email;
         booking.IsActive = true;
 
-       if (tour == null)
-       {
-           return NotFound();
-       }
+        var tour = await _unitOfWork.TourRepository.GetByIdAsync(booking.TourId);
+        if (tour == null)
+            return NotFound("Selected tour not found.");
 
+        // ===== TÍNH GIÁ GỐC =====
+        var totalPrice = tour.Price * booking.NumberOfParticipants;
+        booking.TotalPrice = totalPrice;
 
 decimal finalPrice = totalPrice;
 booking.DiscountAmount = 0;
@@ -161,25 +179,26 @@ if (booking.VoucherId.HasValue)
 
 booking.FinalPrice = Math.Max(0, finalPrice);
 
+        // ===== THANH TOÁN (MOCK) =====
+        switch (booking.PaymentMethod)
+        {
+            case PaymentMethod.CreditCard:
+            case PaymentMethod.EWallet:
+                booking.PaymentStatus = PaymentStatus.Completed;
+                booking.Status = BookingStatus.Confirmed;
+                break;
 
-   // =========================
-   // POST: UserBookings/BookTour
-   // =========================
-   [HttpPost]
-   [ValidateAntiForgeryToken]
-   public async Task<IActionResult> BookTour(Booking booking)
-   {
-       var currentUser = await _userManager.GetUserAsync(User);
-       if (currentUser == null)
-           return Unauthorized();
-      
-       // ===== GÁN DỮ LIỆU HỆ THỐNG =====
-       booking.UserId = currentUser.Id;
-       booking.BookingDate = DateTime.Now;
-       booking.Status = BookingStatus.Pending;
-       booking.PaymentStatus = PaymentStatus.Pending;
-       booking.IsActive = true;
+            case PaymentMethod.BankTransfer:
+                booking.PaymentStatus = PaymentStatus.Pending;
+                booking.Status = BookingStatus.Pending;
+                break;
+        }
 
+        if (!ModelState.IsValid)
+        {
+            ViewBag.Tour = tour;
+            return View(booking);
+        }
 
                 // ===== CỘNG DOANH THU + XÉT HẠNG =====
 if (booking.PaymentStatus == PaymentStatus.Completed)
@@ -207,17 +226,26 @@ if (booking.PaymentStatus == PaymentStatus.Completed)
             TotalPrice = booking.FinalPrice
         };
 
-       // ===== TÍNH GIÁ GỐC =====
-       var totalPrice = tour.Price * booking.NumberOfParticipants;
-       booking.TotalPrice = totalPrice;
+        var pdf = _pdfService.GenerateTicketPdf(ticket);
 
+        await _emailService.SendTicketEmailAsync(
+            currentUser.Email,
+            $"Your Ticket - {ticket.TicketNumber}",
+            "Thank you for booking! Please find your ticket attached.",
+            pdf
+        );
 
-       // ===== XỬ LÝ VOUCHER (NẾU CÓ) =====
-       if (booking.VoucherId.HasValue && booking.DiscountAmount > 0)
-       {
-           var voucher = await _unitOfWork.VoucherRepository
-               .GetByIdAsync(booking.VoucherId.Value);
+        return RedirectToAction(nameof(Success));
+    }
 
+    // =========================
+    // GET: UserBookings/Success
+    // =========================
+    [HttpGet]
+    public IActionResult Success()
+    {
+        return View();
+    }
 
     // =========================
     // GET: UserBookings/MyBookings
@@ -237,48 +265,83 @@ var currentUser = await _userManager.Users
             return Unauthorized();
         }
 
+        var bookingsQuery = (await _unitOfWork.BookingRepository.GetAllAsync(
+            b => b.UserId == currentUser.Id,
+            includeProperties: "Tour.Destination"
+        ))
+        .OrderByDescending(b => b.BookingDate);
 
-           // Giảm tiền
-           booking.FinalPrice = Math.Max(0, totalPrice - booking.DiscountAmount);
+        var vm = new UserMyBookingsViewModel
+        {
+            User = currentUser,
+            Bookings = full
+                ? bookingsQuery.ToList()      // FULL lịch sử
+                : bookingsQuery.Take(3).ToList() // PREVIEW: 3 booking gần nhất
+        };
 
+        ViewBag.IsFullHistory = full;
 
-           // Gắn voucher
-           booking.VoucherId = voucher.VoucherId;
-       }
-       else
-       {
-           booking.FinalPrice = totalPrice;
-       }
+        return View(vm);
+    }
 
+    // =========================
+    // POST: UserBookings/CancelBooking
+    // =========================
+    [HttpPost]
+    [ValidateAntiForgeryToken]
+    public async Task<IActionResult> CancelBooking(int bookingId)
+    {
+        var currentUser = await _userManager.GetUserAsync(User);
+        if (currentUser == null)
+        {
+            return Unauthorized();
+        }
 
-       // ===== THANH TOÁN (MOCK) =====
-       switch (booking.PaymentMethod)
-       {
-           case PaymentMethod.CreditCard:
-           case PaymentMethod.EWallet:
-               booking.PaymentStatus = PaymentStatus.Completed;
-               booking.Status = BookingStatus.Confirmed;
-               break;
+        var booking = await _unitOfWork.BookingRepository.GetByIdAsync(bookingId);
+        if (booking == null || booking.UserId != currentUser.Id)
+        {
+            return NotFound();
+        }
 
+        if (booking.Status == BookingStatus.Cancelled)
+        {
+            return BadRequest("Booking already cancelled.");
+        }
 
-           case PaymentMethod.BankTransfer:
-               booking.PaymentStatus = PaymentStatus.Pending;
-               booking.Status = BookingStatus.Pending;
-               break;
-       }
+        booking.Status = BookingStatus.Cancelled;
+        booking.IsActive = false;
+        _unitOfWork.BookingRepository.Update(booking);
+        await _unitOfWork.CompleteAsync();
+        return RedirectToAction(nameof(MyBookings));
+    }
 
+    // =========================
+    // GET: UserBookings/ExportBookingsPdf
+    // =========================
+    [HttpGet]
+    public async Task<IActionResult> ExportBookingsPdf()
+    {
+        var currentUser = await _userManager.GetUserAsync(User);
+        if (currentUser == null)
+        {
+            return Unauthorized();
+        }
+        Log.Information("User {User} exporting bookings PDF", currentUser.UserName);
 
-       if (!ModelState.IsValid)
-       {
-           ViewBag.Tour = tour;
-           return View(booking);
-       }
+        var bookings = await _unitOfWork.BookingRepository.GetAllAsync(
+            b => b.UserId == currentUser.Id,
+            includeProperties: "Tour"
+        );
 
+        if (!bookings.Any())
+        {
+            return NotFound("No bookings found.");
+        }
 
-       // ===== SAVE BOOKING =====
-       await _unitOfWork.BookingRepository.AddAsync(booking);
-       await _unitOfWork.CompleteAsync();
+        var pdf = _pdfService.GenerateBookingsPdf(bookings.ToList());
 
+        return File(pdf, "application/pdf", "MyBookings.pdf");
+    }
 
     // =========================
     // GET: UserBookings/History
@@ -298,8 +361,16 @@ if (currentUser == null)
         if (currentUser == null)
             return Unauthorized();
 
+        var bookings = await _unitOfWork.BookingRepository.GetAllAsync(
+            b => b.UserId == currentUser.Id,
+            includeProperties: "Tour.Destination"
+        );
 
-       var pdf = _pdfService.GenerateTicketPdf(ticket);
+        var vm = new UserMyBookingsViewModel
+        {
+            User = currentUser,
+            Bookings = bookings
+        };
 
         return View(vm);
     }
@@ -317,8 +388,4 @@ if (currentUser == null)
         user.MembershipTierId = matchedTier.Id;
     }
 }
-
 }
-
-
-
